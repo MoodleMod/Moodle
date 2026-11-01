@@ -1,0 +1,74 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "_artifactsLocation": {
+            "type": "string",
+            "metadata": {
+                "description": "The base URI where artifacts required by this template are located. When the template is deployed using the accompanying scripts, a private location in the subscription will be used and this value will be automatically generated."
+            },
+            "defaultValue": "https://raw.githubusercontent.com/MoodleMod/Moodle/5.3dev/"
+        },
+        "_artifactsLocationSasToken": {
+            "type": "securestring",
+            "metadata": {
+                "description": "The sasToken required to access _artifactsLocation.  When the template is deployed using the accompanying scripts, a sasToken will be automatically generated."
+            },
+            "defaultValue": ""
+        },
+        "sshPublicKey": {
+            "metadata": {
+                "description": "ssh public key"
+            },
+            "type": "string"
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Resources/deployments",
+            "apiVersion": "2021-01-01",
+            "name": "mainTemplate",
+            "properties": {
+                "mode": "Incremental",
+                "parameters": {
+                    "_artifactsLocation":           { "value": "[parameters('_artifactsLocation')]" },
+                    "_artifactsLocationSasToken":   { "value": "[parameters('_artifactsLocationSasToken')]" },
+                    "sshPublicKey":                 { "value": "[parameters('sshPublicKey')]" },
+                    "controllerVmSku":              { "value": "Standard_B2s" },
+                    "autoscaleVmSku":               { "value": "Standard_B2s" },
+                    "autoscaleVmCountMin":          { "value": 1 },
+                    "autoscaleVmCountMax":          { "value": 1 },
+                    "enableAccelNwForCtlrVmSwitch": { "value": false },
+                    "enableAccelNwForOtherVmsSwitch": { "value": false },
+                    "osDiskStorageType":            { "value": "Standard_LRS" },
+                    "OSDiskSizeInGB":               { "value": 64 },
+                    "dbServerType":                 { "value": "mysqlflex" },
+                    "mysqlflexSkuName":             { "value": "Standard_B1ms" },
+                    "vnetDbDeploySwitch":           { "value": true },
+                    "redisDeploySwitch":            { "value": true },
+                    "redisSkuName":                 { "value": "Balanced_B0" },
+                    "redisHighAvailability":        { "value": "Disabled" },
+                    "fileServerType":               { "value": "nfs" },
+                    "fileServerDiskCount":          { "value": 2 },
+                    "fileServerDiskSize":           { "value": 32 },
+                    "storageAccountType":           { "value": "Standard_LRS" }
+                },
+                "templateLink": {
+                    "uri": "[concat(parameters('_artifactsLocation'), 'azuredeploy.json', parameters('_artifactsLocationSasToken'))]"
+                }
+            }
+        }
+    ],
+    "outputs": {
+        "mainTemplateOutputs": {
+            "type": "object",
+            "value": "[reference('mainTemplate').outputs]"
+        }
+    },
+    "variables": {
+        "documentation01": "This wrapper template calls the main-template with the cheapest configuration that still mirrors the production service topology.",
+        "documentation02": "Kept identical to production: VMSS web tier behind LB (nginx, VMSS https termination), NFS share on controller, MySQL Flexible Server 8.4 in a private vnet, Azure Managed Redis (TLS, private endpoint), local html copy.",
+        "documentation03": "Reduced for cost: burstable Standard_B2s VMs (no accelerated networking on B-series), single web node, Standard_LRS 64GB OS disks, MySQL Standard_B1ms, Redis Balanced_B0 non-HA, 2x32GB data disks.",
+        "documentation04": "Only required parameter is sshPublicKey."
+    }
+}

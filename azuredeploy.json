@@ -37,6 +37,24 @@
             },
             "type": "bool"
         },
+        "redisSkuName": {
+            "defaultValue": "Balanced_B20",
+            "metadata": {
+                "description": "Azure Managed Redis (redisEnterprise) SKU. Balanced_B0/B1 are the cheapest options for dev/test; Balanced_B20 is the production default."
+            },
+            "type": "string"
+        },
+        "redisHighAvailability": {
+            "defaultValue": "Enabled",
+            "allowedValues": [
+                "Enabled",
+                "Disabled"
+            ],
+            "metadata": {
+                "description": "High availability (replication) for Azure Managed Redis. Disable to halve cost on dev/test deployments."
+            },
+            "type": "string"
+        },
         "vnetGwDeploySwitch": {
             "defaultValue": false,
             "metadata": {
@@ -1283,6 +1301,8 @@
             "postgresStorageSizeGiB": "[parameters('postgresStorageSizeGiB')]",
             "redisCacheName": "[concat('redis-',variables('resourceprefix'))]",
             "redisDeploySwitch": "[parameters('redisDeploySwitch')]",
+            "redisSkuName": "[parameters('redisSkuName')]",
+            "redisHighAvailability": "[parameters('redisHighAvailability')]",
             "redisDns": "[concat('redis-',variables('resourceprefix'),'.',parameters('location'),'.redis.azure.net')]",
             "resourcesPrefix": "[variables('resourceprefix')]",
             "searchType": "[parameters('searchType')]",

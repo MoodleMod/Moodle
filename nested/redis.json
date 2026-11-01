@@ -22,10 +22,10 @@
             "location": "[parameters('moodleCommon').location]",
             "name": "[parameters('moodleCommon').redisCacheName]",
             "sku": {
-                "name": "Balanced_B20"
+                "name": "[parameters('moodleCommon').redisSkuName]"
             },
             "properties": {
-                "highAvailability": "Enabled",
+                "highAvailability": "[parameters('moodleCommon').redisHighAvailability]",
                 "minimumTlsVersion": "1.2",
                 "publicNetworkAccess": "Disabled"
             }
