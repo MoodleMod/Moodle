@@ -49,7 +49,7 @@ warning) — but smoke-test thoroughly before declaring success.
 **IMPORTANT NOTE**
 
 In this example the plugin releases that replace the 4.5-compatible
-versions (the `MOODLE_500_STABLE` 5.0.x releases used below) only
+versions (the 5.0.x releases pinned below) only
 declare support up to **Moodle 5.2**. The Workplace developers (Moodle
 HQ) make **no compatibility claim for Moodle 5.3**. They were found to
 work on a Moodle 5.3 target during this migration, but they have
@@ -64,31 +64,47 @@ Save this backup under a **different filename** than the
 pre-migration backup — reusing
 `/moodle/db-backup-pre-migration.sql.gz` would overwrite the only
 copy of the original target database that the migration guide's
-rollback relies on:
+rollback relies on. `set -o pipefail` makes a failed `mysqldump`
+abort the pipeline instead of leaving an empty archive:
 
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --enable
+set -o pipefail
 mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
   -p"$MOODLE_DATABASE_ADMIN_PASSWORD" --single-transaction moodle \
   | gzip > /moodle/db-backup-pre-plugins.sql.gz
+gunzip -t /moodle/db-backup-pre-plugins.sql.gz   # verify before continuing
 ```
 
 ## Download and install the plugin code
 
-Download pinned versions from the official GitHub repositories (the
-Marketplace download URLs are not reliably fetchable with `curl`):
+Download **pinned releases** from the official GitHub repositories
+(the Marketplace download URLs are not reliably fetchable with
+`curl`). Do not download a moving branch such as `MOODLE_500_STABLE` —
+its content changes over time, so you could install different code
+from what was verified. Pick the release **tag** for the 5.0.x version
+you validated against the migrated database (see the version check
+above and each repository's *Releases* page), and record it:
 
 ```bash
-cd /tmp && rm -f *.zip
+# Substitute the release tags you verified, e.g. the 5.0.x releases
+TOOL_CERT_TAG="<tool_certificate-release-tag>"
+MOD_CERT_TAG="<mod_coursecertificate-release-tag>"
+
+mkdir -p /tmp/moodle-plugins && cd /tmp/moodle-plugins
+rm -f tool_certificate.zip mod_coursecertificate.zip
 curl -fLo tool_certificate.zip \
-  "https://github.com/moodleworkplace/moodle-tool_certificate/archive/refs/heads/MOODLE_500_STABLE.zip"
+  "https://github.com/moodleworkplace/moodle-tool_certificate/archive/refs/tags/${TOOL_CERT_TAG}.zip"
 curl -fLo mod_coursecertificate.zip \
-  "https://github.com/moodleworkplace/moodle-mod_coursecertificate/archive/refs/heads/MOODLE_500_STABLE.zip"
+  "https://github.com/moodleworkplace/moodle-mod_coursecertificate/archive/refs/tags/${MOD_CERT_TAG}.zip"
 file *.zip   # both must report "Zip archive data"
 
 unzip -q tool_certificate.zip && unzip -q mod_coursecertificate.zip
-mv moodle-tool_certificate-MOODLE_500_STABLE certificate
-mv moodle-mod_coursecertificate-MOODLE_500_STABLE coursecertificate
+mv moodle-tool_certificate-*    certificate
+mv moodle-mod_coursecertificate-* coursecertificate
+
+# Record the exact plugin versions being installed
+grep -h '\$plugin->\(version\|release\)' certificate/version.php coursecertificate/version.php
 ```
 
 Install the code into the shared tree. Plugins go into their own
@@ -99,11 +115,13 @@ root. Use `cp` + `rm` rather than `mv` because `/tmp` (local disk) and
 ```bash
 sudo mkdir -p /moodle/html/moodle/public/admin/tool/certificate \
               /moodle/html/moodle/public/mod/coursecertificate
-sudo cp -a /tmp/certificate/.       /moodle/html/moodle/public/admin/tool/certificate/
-sudo cp -a /tmp/coursecertificate/. /moodle/html/moodle/public/mod/coursecertificate/
+sudo cp -a /tmp/moodle-plugins/certificate/.       /moodle/html/moodle/public/admin/tool/certificate/
+sudo cp -a /tmp/moodle-plugins/coursecertificate/. /moodle/html/moodle/public/mod/coursecertificate/
 sudo chown -R www-data:www-data /moodle/html/moodle/public/admin/tool/certificate \
                                 /moodle/html/moodle/public/mod/coursecertificate
-sudo rm -rf /tmp/certificate /tmp/coursecertificate /tmp/*.zip
+# Remove only this guide's dedicated staging directory — never /tmp/*.zip,
+# which would delete unrelated archives in the shared /tmp
+sudo rm -rf /tmp/moodle-plugins
 
 # Sanity check: version.php must be at the top level of each plugin directory
 ls /moodle/html/moodle/public/admin/tool/certificate/version.php \
@@ -112,7 +130,7 @@ ls /moodle/html/moodle/public/admin/tool/certificate/version.php \
 
 ## Upgrade, propagate and verify
 
-Repeat Steps 5–8 of the [migration
+Repeat Steps 5 and 7–9 of the [migration
 guide](./Migration-4.5-to-5.3.md) (upgrade, controller cache purge,
 propagation to the web frontends, then disable maintenance mode).
 Because the migrated database already holds the source plugin
@@ -135,27 +153,41 @@ Finally verify:
 
 ## Rolling back
 
-To restore the database to its pre-plugin state, use the
-reset-and-import strategy from Step 3 of the migration guide with
-`/moodle/db-backup-pre-plugins.sql.gz`.
-
-To remove the certificate plugin code without touching the migrated
-data (the data stays in the database and filedir):
+Perform the rollback as **one ordered procedure under maintenance
+mode**. Restoring the database while the newer plugin code is still
+installed (or removing code against a database that recorded the newer
+versions) leaves a code/schema mismatch: Moodle immediately requests
+another upgrade, or detects a plugin-version hash mismatch and
+suspends cron.
 
 ```bash
+# 1 — close the site first
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --enable
+
+# 2 — restore the pre-plugin database (reset-and-import, as in Step 3
+#     of the migration guide)
+mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+  -p"$MOODLE_DATABASE_ADMIN_PASSWORD" -e \
+  "DROP DATABASE moodle; CREATE DATABASE moodle DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+gunzip < /moodle/db-backup-pre-plugins.sql.gz \
+  | mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+      -p"$MOODLE_DATABASE_ADMIN_PASSWORD" moodle
+
+# 3 — remove the plugin code so it matches the restored database
+#     (the migrated certificate data stays in the database and filedir)
 rm -rf /moodle/html/moodle/public/admin/tool/certificate \
        /moodle/html/moodle/public/mod/coursecertificate
 
-# Record the new plugin set — without this Moodle detects a
-# plugin-version hash mismatch and suspends cron
+# 4 — record the new plugin set and rebuild/purge caches; without
+#     upgrade.php Moodle detects a plugin-version hash mismatch and
+#     suspends cron
 rm -f /var/www/html/moodle/core_component.php
 sudo -u www-data php /moodle/html/moodle/admin/cli/alternative_component_cache.php --rebuild
 sudo -u www-data php /moodle/html/moodle/admin/cli/upgrade.php --non-interactive
-
 sudo -u www-data php /moodle/html/moodle/admin/cli/purge_caches.php
 ```
 
-Then repeat Steps 7 and 8 of the migration guide (propagate to the
-web frontends — classmap rebuild and service restarts happen only
-there, never on the controller — and disable maintenance mode).
+Only then repeat Steps 8 and 9 of the migration guide: propagate to
+the web frontends (classmap rebuild and service restarts happen only
+there, never on the controller) and, after **every** frontend is
+synchronized, disable maintenance mode.
