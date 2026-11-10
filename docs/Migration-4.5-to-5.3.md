@@ -19,7 +19,16 @@ In order to configure our deployment and tools we'll set up some
 [environment variables](./Environment-Variables.md) to ensure consistency.
 
 In order to migrate a site it is clearly necessary to first [deploy a
-scalable Moodle cluster on Azure](./Deploy.md).
+scalable Moodle cluster on Azure](./Deploy.md). This guide assumes the
+target was deployed with (see [Parameters](./Parameters.md)):
+
+* `fileServerType=azurefiles` — the AzCopy pass in Step 2 copies
+  share-to-share; with the default `nfs` file server the `/moodle`
+  share does not exist and the dump and files never arrive
+* `dbServerType=mysqlflex` with the default database name `moodle` —
+  all database commands below are MySQL
+* `webServerType=nginx` and `htmlLocalCopySwitch=true` — the frontend
+  propagation step relies on the local-copy sync scripts
 
 **IMPORTANT NOTE**
 
@@ -41,12 +50,27 @@ Files share, prepared as follows:
 
 * `moodledata/` — the source site's moodledata directory
 * `source-db.sql.gz` — a `mysqldump` of the source Moodle 4.5
-  database, placed in the share root next to `moodledata/`:
+  database, placed in the share root next to `moodledata/`.
 
-  ```bash
-  mysqldump -h <source-mysql-host> -u <source-dbadmin> -p'<source-dbadminpass>' \
-    --single-transaction moodle | gzip > source-db.sql.gz
-  ```
+**Freeze the source site before taking the dump.** `mysqldump
+--single-transaction` snapshots the database but not the filesystem:
+if the source keeps running, cron cleanup can move files the dump
+still references into `trashdir/` before Step 2 copies them, and any
+submissions made after the dump are lost at cutover. On the source,
+enable maintenance mode and stop cron (and any other writers), and
+keep it frozen through the copy and the cutover:
+
+```bash
+sudo -u www-data php <source-moodle>/admin/cli/maintenance.php --enable
+# stop the source cron, e.g.:
+crontab -u www-data -l   # note the moodle cron entry, then remove/comment it
+
+# take the dump; pipefail makes a failed mysqldump abort the pipeline
+# instead of leaving a truncated-but-valid-looking archive
+set -o pipefail
+mysqldump -h <source-mysql-host> -u <source-dbadmin> -p'<source-dbadminpass>' \
+  --single-transaction moodle | gzip > source-db.sql.gz
+```
 
 If the source site does not live on Azure Files, upload `moodledata/`
 and the dump to a temporary share first (`azcopy copy` from the source
@@ -86,7 +110,7 @@ the database **admin** credentials are in the deployment outputs
    (4.2 or later is recommended; this guide assumes 4.5). Upgrade the
    source first if it is older.
 5. **Keep maintenance mode enabled until the web frontends are
-   synchronized** (Step 7); it is only disabled afterwards (Step 8).
+   synchronized** (Step 8); it is only disabled afterwards (Step 9).
    Disabling it earlier lets requests reach an upgraded database
    through frontends that still run stale code and caches.
 
@@ -94,16 +118,25 @@ the database **admin** credentials are in the deployment outputs
 
 Take the backup with the database **admin** account — default dumps
 contain `LOCK TABLES` statements that the application user from
-`config.php` is not granted:
+`config.php` is not granted. `set -o pipefail` makes a failed
+`mysqldump` abort the pipeline instead of leaving an empty archive
+that Step 3 would then trust:
 
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --enable
+set -o pipefail
 mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
   -p"$MOODLE_DATABASE_ADMIN_PASSWORD" --single-transaction moodle \
   | gzip > /moodle/db-backup-pre-migration.sql.gz
 ```
 
-Maintenance mode stays enabled through Step 7.
+Verify the backup is non-empty and intact before continuing:
+
+```bash
+gunzip -t /moodle/db-backup-pre-migration.sql.gz && ls -l /moodle/db-backup-pre-migration.sql.gz
+```
+
+Maintenance mode stays enabled through Step 8.
 
 ## Step 2 — Copy moodledata and the database dump in one AzCopy pass
 
@@ -166,14 +199,17 @@ gunzip < /moodle/source-db.sql.gz \
 
 If the source database uses a table prefix other than the target's
 `$CFG->prefix` (default `mdl_`), the upgrade would read the wrong
-tables. Compare them:
+tables. Compare them — the prefix is taken from the core
+`config_plugins` table, whose name is unambiguous in a dump:
 
 ```bash
 grep 'CFG->prefix' /moodle/html/moodle/config.php
-zcat /moodle/source-db.sql.gz | grep -o -m1 'CREATE TABLE `[a-z0-9_]*config`'
+zcat /moodle/source-db.sql.gz | grep -o -m1 'CREATE TABLE `[a-z0-9_]*config_plugins`'
 ```
 
-If they differ, edit `/moodle/html/moodle/config.php` and set
+The source prefix is the table name with the `config_plugins` suffix
+removed (for example `mdl_config_plugins` → `mdl_`). If it differs
+from the target's, edit `/moodle/html/moodle/config.php` and set
 `$CFG->prefix` to the **source** prefix before continuing.
 
 ## Step 5 — Run the upgrade (4.5 → 5.3)
@@ -191,7 +227,29 @@ rm -f /var/www/html/moodle/core_component.php
 sudo -u www-data php /moodle/html/moodle/admin/cli/alternative_component_cache.php --rebuild
 ```
 
-## Step 6 — Purge caches on the controller
+## Step 6 — Reconcile stored URLs (if the hostname changed)
+
+A fresh deployment generates its own public hostname by default, but
+the imported content still contains absolute links to the **source**
+site (in course HTML, forum posts, etc.) — keeping the target
+`config.php` only fixes `$CFG->wwwroot`, not stored content. Choose
+one:
+
+* **Retain the source public URL**: point its DNS (or Front Door /
+  load-balancer custom domain) at the new cluster, and skip the
+  replacement below; or
+* **Rewrite stored URLs** with Moodle's database search-and-replace
+  tool:
+
+```bash
+sudo -u www-data php /moodle/html/moodle/public/admin/tool/replace/cli/replace.php \
+  --search='https://<source-hostname>' --replace="https://<target-hostname>" --non-interactive
+```
+
+Skip this step entirely only when source and target share the same
+public hostname.
+
+## Step 7 — Purge caches on the controller
 
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/purge_caches.php
@@ -207,7 +265,7 @@ listener on the controller's public IP that bypasses the frontend
 load balancer. Maintenance mode also stays **enabled** — the web
 frontends have not been synchronized yet.
 
-## Step 7 — Propagate code and caches to the web frontends
+## Step 8 — Propagate code and caches to the web frontends
 
 As described in [the management documentation](./Manage.md#updating-moodle-codesettings),
 the web frontends keep a local copy of the Moodle code. After a
@@ -237,7 +295,7 @@ Rebuild the component cache (classmap) from each node's **local**
 tree, not the shared one — shared-tree paths in the classmap cause
 `Cannot declare class ...` fatal errors on web requests.
 
-## Step 8 — Disable maintenance mode
+## Step 9 — Disable maintenance mode
 
 Only after **every** web frontend has been synchronized, disable
 maintenance mode from the controller:
@@ -246,7 +304,7 @@ maintenance mode from the controller:
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --disable
 ```
 
-## Step 9 — Verify the migration
+## Step 10 — Verify the migration
 
 Derive the site hostname from `MOODLE_SITE_URL`
 (set in [Get-Install-Data](./Get-Install-Data.md)):
@@ -298,10 +356,18 @@ mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
 gunzip < /moodle/db-backup-pre-migration.sql.gz \
   | mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
       -p"$MOODLE_DATABASE_ADMIN_PASSWORD" moodle
+```
+
+If `$CFG->prefix` was changed in Step 4, restore the original target
+value in `/moodle/html/moodle/config.php` **now** — the restored
+backup contains the original target-prefixed tables, and every Moodle
+CLI command (including the cache purge below) bootstraps with the
+configured prefix and fails against missing tables. Then:
+
+```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/purge_caches.php
 ```
 
-If `$CFG->prefix` was changed in Step 4, restore the original value.
-Then repeat Step 7 (propagate to the web frontends — restarts happen
-only there, never on the controller) and Step 8 (disable maintenance
+Then repeat Step 8 (propagate to the web frontends — restarts happen
+only there, never on the controller) and Step 9 (disable maintenance
 mode).
