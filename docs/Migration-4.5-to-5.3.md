@@ -7,10 +7,11 @@ to the deployed code version. It is based on a verified migration of
 this exact scenario.
 
 Only the **database and moodledata files** are migrated by this
-process. The Moodle code stays as deployed by the template. Add-on
-plugin code is not migrated automatically — see [Migrating add-on
-plugins](#migrating-add-on-plugins-workplace-certificates) below for
-installing the Moodle Workplace certificate plugins on the target.
+process — in a single server-side AzCopy pass that leaves every cache
+behind. The Moodle code stays as deployed by the template. Add-on
+plugin code is not migrated automatically — see [Migrating the
+Workplace certificate plugins](./Migration-Workplace-Certificate-Plugins.md)
+for installing add-on plugin code on the target after this migration.
 
 ## Prerequisites
 
@@ -27,24 +28,41 @@ components in a new resource group** — a newly deployed controller VM,
 web frontends, database server, Redis cache and file share that have
 not served production traffic and hold no data worth keeping. Do not
 run this migration against a resource group with an existing,
-in-service Moodle installation: Step 2 replaces the entire target
-database and Step 3 overlays moodledata, destroying whatever was there
+in-service Moodle installation: Step 2 overlays moodledata and Step 3
+replaces the entire target database, destroying whatever was there
 before.
 
 For convenience and readability this document also assumes that
 essential [deployment details for your cluster have been assigned to
 environment variables](./Get-Install-Data.md).
 
-In addition you will need the source site artifacts:
+In addition you will need read access to the **source** site's Azure
+Files share, prepared as follows:
 
-* `source-db.sql.gz` — a `mysqldump` of the source Moodle 4.5 database
-* the source `moodledata/filedir` directory (plus `lang/` if customized)
+* `moodledata/` — the source site's moodledata directory
+* `source-db.sql.gz` — a `mysqldump` of the source Moodle 4.5
+  database, placed in the share root next to `moodledata/`:
 
-All commands below run **on the controller VM** (for example via
-Bastion or `az vm run-command invoke -g $MOODLE_RG_NAME -n
-<controller-vm>`), as root unless noted. The database credentials for
-the target cluster are in `/moodle/html/moodle/config.php` (`dbhost`,
-`dbuser`, `dbpass`).
+  ```bash
+  mysqldump -h <source-mysql-host> -u <source-dbadmin> -p'<source-dbadminpass>' \
+    --single-transaction moodle | gzip > source-db.sql.gz
+  ```
+
+If the source site does not live on Azure Files, upload `moodledata/`
+and the dump to a temporary share first (`azcopy copy` from the source
+server) so that the migration pass in Step 2 remains a fast
+server-side copy.
+
+Except for the AzCopy pass (Step 2, runs anywhere with `azcopy` and
+the Azure CLI), all commands below run **on the controller VM** (for
+example via Bastion or `az vm run-command invoke -g $MOODLE_RG_NAME -n
+<controller-vm>`), as root unless noted. The application database
+credentials for the target cluster are in
+`/moodle/html/moodle/config.php` (`dbhost`, `dbuser`, `dbpass`);
+the database **admin** credentials are in the deployment outputs
+(`MOODLE_DATABASE_DNS`, `MOODLE_DATABASE_ADMIN_USERNAME`,
+`MOODLE_DATABASE_ADMIN_PASSWORD` — see
+[Get-Install-Data](./Get-Install-Data.md)).
 
 ## Important rules before you begin
 
@@ -67,41 +85,98 @@ the target cluster are in `/moodle/html/moodle/config.php` (`dbhost`,
 4. The source Moodle major version must be upgrade-compatible with 5.3
    (4.2 or later is recommended; this guide assumes 4.5). Upgrade the
    source first if it is older.
+5. **Keep maintenance mode enabled until the web frontends are
+   synchronized** (Step 7); it is only disabled afterwards (Step 8).
+   Disabling it earlier lets requests reach an upgraded database
+   through frontends that still run stale code and caches.
 
 ## Step 1 — Enable maintenance mode and take a safety backup
 
+Take the backup with the database **admin** account — default dumps
+contain `LOCK TABLES` statements that the application user from
+`config.php` is not granted:
+
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --enable
-mysqldump -h <mysql-host> -u <dbuser> -p'<dbpass>' --single-transaction --databases moodle \
+mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+  -p"$MOODLE_DATABASE_ADMIN_PASSWORD" --single-transaction moodle \
   | gzip > /moodle/db-backup-pre-migration.sql.gz
 ```
 
-## Step 2 — Import the source database
+Maintenance mode stays enabled through Step 7.
+
+## Step 2 — Copy moodledata and the database dump in one AzCopy pass
+
+A single server-side `azcopy` pass moves the source moodledata **and**
+the database dump to the target share, and leaves every cache and
+session directory behind. Run it from any machine with `azcopy` and
+the Azure CLI:
 
 ```bash
-gunzip < source-db.sql.gz | mysql -h <mysql-host> -u <dbuser> -p'<dbpass>' moodle
+# SAS tokens for the source and target shares (valid 8 hours)
+exp=$(date -u -d "+8 hours" '+%Y-%m-%dT%H:%MZ')
+srcKey=$(az storage account keys list -g <source-rg> -n <source-account> --query "[0].value" -o tsv)
+tgtKey=$(az storage account keys list -g $MOODLE_RG_NAME -n <target-account> --query "[0].value" -o tsv)
+srcSas=$(az storage share generate-sas --account-name <source-account> --account-key "$srcKey" \
+  -n moodle --permissions rl --expiry $exp -o tsv)
+tgtSas=$(az storage share generate-sas --account-name <target-account> --account-key "$tgtKey" \
+  -n moodle --permissions rwdlc --expiry $exp -o tsv)
+
+# One pass: moodledata + database dump; code tree and caches are never copied
+azcopy copy \
+  "https://<source-account>.file.core.windows.net/moodle?$srcSas" \
+  "https://<target-account>.file.core.windows.net/moodle?$tgtSas" \
+  --recursive --overwrite=ifSourceNewer --preserve-smb-info=false \
+  --include-path "moodledata;source-db.sql.gz" \
+  --exclude-path "moodledata/muc;moodledata/cache;moodledata/localcache;moodledata/sessions;moodledata/temp;moodledata/trashdir;moodledata/lock"
 ```
 
-## Step 3 — Copy the moodledata content
+* `--include-path` restricts the copy to `moodledata/` and the dump —
+  the source **code tree is never copied** (rule 1)
+* `--exclude-path` leaves every cache behind (rule 3); in particular
+  the deployed `/moodle/moodledata/muc/config.php`, which points at
+  this environment's Redis cache, is never overwritten
+* The copy is server-side; for large shares run it inside `tmux` so it
+  survives disconnects, and resume interruptions with
+  `azcopy jobs resume <job-id> --source-sas "$srcSas" --destination-sas "$tgtSas"`
 
-Copy **only** user content — exclude every cache and session
-directory:
+Then fix ownership **on the controller VM**:
 
 ```bash
-rsync -a \
-  --exclude=muc --exclude=cache --exclude=localcache \
-  --exclude=sessions --exclude=temp --exclude=trashdir --exclude=lock \
-  <source-moodledata>/ /moodle/moodledata/
 chown -R www-data:www-data /moodle/moodledata
 ```
 
-**IMPORTANT NOTE**
+## Step 3 — Reset and import the database
 
-Do **not** overwrite `/moodle/moodledata/muc/config.php` — the
-deployed one points at this environment's Redis cache. A copied source
-`muc/config.php` will break every web request.
+Importing the dump over the freshly deployed 5.3 schema would leave
+target-only tables behind, which can make the upgrade fail with
+"table already exists" errors. Drop and recreate the database first,
+and import as the database **admin** user (`LOCK TABLES`, see Step 1):
 
-## Step 4 — Run the upgrade (4.5 → 5.3)
+```bash
+mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+  -p"$MOODLE_DATABASE_ADMIN_PASSWORD" -e \
+  "DROP DATABASE moodle; CREATE DATABASE moodle DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+gunzip < /moodle/source-db.sql.gz \
+  | mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+      -p"$MOODLE_DATABASE_ADMIN_PASSWORD" moodle
+```
+
+## Step 4 — Reconcile the table prefix
+
+If the source database uses a table prefix other than the target's
+`$CFG->prefix` (default `mdl_`), the upgrade would read the wrong
+tables. Compare them:
+
+```bash
+grep 'CFG->prefix' /moodle/html/moodle/config.php
+zcat /moodle/source-db.sql.gz | grep -o -m1 'CREATE TABLE `[a-z0-9_]*config`'
+```
+
+If they differ, edit `/moodle/html/moodle/config.php` and set
+`$CFG->prefix` to the **source** prefix before continuing.
+
+## Step 5 — Run the upgrade (4.5 → 5.3)
 
 ```bash
 cd /tmp
@@ -116,16 +191,23 @@ rm -f /var/www/html/moodle/core_component.php
 sudo -u www-data php /moodle/html/moodle/admin/cli/alternative_component_cache.php --rebuild
 ```
 
-## Step 5 — Purge caches and disable maintenance mode
+## Step 6 — Purge caches on the controller
 
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/purge_caches.php
-sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --disable
 rm -rf /tmp/localcachedir
-systemctl restart php8.3-fpm nginx varnish
 ```
 
-## Step 6 — Propagate code and caches to the web frontends
+**IMPORTANT NOTE**
+
+Do **not** restart web services on the controller. The deployment
+deliberately stops nginx, PHP-FPM and Varnish there
+(`scripts/install_moodle.sh`); restarting them would reopen a web
+listener on the controller's public IP that bypasses the frontend
+load balancer. Maintenance mode also stays **enabled** — the web
+frontends have not been synchronized yet.
+
+## Step 7 — Propagate code and caches to the web frontends
 
 As described in [the management documentation](./Manage.md#updating-moodle-codesettings),
 the web frontends keep a local copy of the Moodle code. After a
@@ -155,7 +237,25 @@ Rebuild the component cache (classmap) from each node's **local**
 tree, not the shared one — shared-tree paths in the classmap cause
 `Cannot declare class ...` fatal errors on web requests.
 
-## Step 7 — Verify the migration
+## Step 8 — Disable maintenance mode
+
+Only after **every** web frontend has been synchronized, disable
+maintenance mode from the controller:
+
+```bash
+sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --disable
+```
+
+## Step 9 — Verify the migration
+
+Derive the site hostname from `MOODLE_SITE_URL`
+(set in [Get-Install-Data](./Get-Install-Data.md)):
+
+```bash
+MOODLE_SITE_HOSTNAME="${MOODLE_SITE_URL#https://}"
+MOODLE_SITE_HOSTNAME="${MOODLE_SITE_HOSTNAME#http://}"
+MOODLE_SITE_HOSTNAME="${MOODLE_SITE_HOSTNAME%%/*}"
+```
 
 ```bash
 # On a web frontend — expect 200 and the login page title
@@ -179,132 +279,29 @@ Results:
 Then log in as an administrator and check *Site administration →
 Notifications* and the plugins overview page.
 
-## Migrating add-on plugins (Workplace certificates)
-
-The database import and moodledata copy move the certificate **data**,
-but the certificate **plugin code** is not installed on the target
-deployment, so templates, issued certificates and the course
-activities will be invisible until the plugins are installed. The
-plugins involved are maintained by Moodle HQ and are LMS-compatible:
-
-| Plugin | Frankenstyle | Install path (5.x `public/` layout) |
-|---|---|---|
-| Workplace certificate manager | `tool_certificate` | `/moodle/html/moodle/public/admin/tool/certificate` |
-| Workplace course certificate | `mod_coursecertificate` | `/moodle/html/moodle/public/mod/coursecertificate` |
-
-`mod_coursecertificate` depends on `tool_certificate` — always
-install/upgrade `tool_certificate` first and keep both plugins on the
-same release train.
-
-### Check the plugin versions the migrated database expects
-
-The code you install must be the same version or **newer** than the
-version recorded in the migrated database, otherwise Moodle refuses to
-start the plugins ("downgrade detected"):
-
-```bash
-mysql -h <mysql-host> -u <dbuser> -p'<dbpass>' moodle -e \
-  "SELECT plugin, value AS db_version FROM mdl_config_plugins
-   WHERE plugin IN ('tool_certificate','mod_coursecertificate') AND name='version';"
-```
-
-Check the [tool_certificate](https://marketplace.moodle.com/plugins/tool_certificate/versions)
-and [mod_coursecertificate](https://marketplace.moodle.com/plugins/mod_coursecertificate/versions)
-version pages for a release that supports your target Moodle version.
-If the newest release only declares support for an older Moodle
-version, installation still proceeds as long as the plugin's
-`$plugin->requires` is satisfied (undeclared support produces only a
-warning) — but smoke-test thoroughly before declaring success.
-
-**IMPORTANT NOTE**
-
-In this example the plugin releases that replace the 4.5-compatible
-versions (the `MOODLE_500_STABLE` 5.0.x releases used below) only
-declare support up to **Moodle 5.2**. The Workplace developers (Moodle
-HQ) make **no compatibility claim for Moodle 5.3**. They were found to
-work on a Moodle 5.3 target during this migration, but they have
-**not been exhaustively tested** on 5.3 — treat them as working at
-your own risk, run the verification checklist below immediately after
-installing, and check the Marketplace version pages above for a
-release that officially declares 5.3 support before executing.
-
-### Download and install the plugin code
-
-Download pinned versions from the official GitHub repositories (the
-Marketplace download URLs are not reliably fetchable with `curl`):
-
-```bash
-cd /tmp && rm -f *.zip
-curl -fLo tool_certificate.zip \
-  "https://github.com/moodleworkplace/moodle-tool_certificate/archive/refs/heads/MOODLE_500_STABLE.zip"
-curl -fLo mod_coursecertificate.zip \
-  "https://github.com/moodleworkplace/moodle-mod_coursecertificate/archive/refs/heads/MOODLE_500_STABLE.zip"
-file *.zip   # both must report "Zip archive data"
-
-unzip -q tool_certificate.zip && unzip -q mod_coursecertificate.zip
-mv moodle-tool_certificate-MOODLE_500_STABLE certificate
-mv moodle-mod_coursecertificate-MOODLE_500_STABLE coursecertificate
-```
-
-Install the code into the shared tree. Plugins go into their own
-subdirectories under `public/` — never unzip anything over the
-root. Use `cp` + `rm` rather than `mv` because `/tmp` (local disk) and
-`/moodle` (Azure Files) are different filesystems:
-
-```bash
-sudo mkdir -p /moodle/html/moodle/public/admin/tool/certificate \
-              /moodle/html/moodle/public/mod/coursecertificate
-sudo cp -a /tmp/certificate/.       /moodle/html/moodle/public/admin/tool/certificate/
-sudo cp -a /tmp/coursecertificate/. /moodle/html/moodle/public/mod/coursecertificate/
-sudo chown -R www-data:www-data /moodle/html/moodle/public/admin/tool/certificate \
-                                /moodle/html/moodle/public/mod/coursecertificate
-sudo rm -rf /tmp/certificate /tmp/coursecertificate /tmp/*.zip
-
-# Sanity check: version.php must be at the top level of each plugin directory
-ls /moodle/html/moodle/public/admin/tool/certificate/version.php \
-   /moodle/html/moodle/public/mod/coursecertificate/version.php
-```
-
-### Upgrade, propagate and verify
-
-Repeat Steps 1, 4, 5 and 6 above (maintenance mode, upgrade,
-cache purge, propagation to the web frontends). Because the migrated
-database already holds the source plugin versions, Moodle runs the
-plugins' own upgrade steps against the existing tables — the migrated
-templates and issued certificates are preserved, not recreated.
-
-Finally verify:
-
-1. *Site administration → Plugins → Plugins overview*: both plugins
-   listed, no "missing from disk"
-2. *Site administration → Certificates → Manage certificate
-   templates*: migrated templates render with their images
-3. Open a course with a Course certificate activity and download a PDF
-   as a test student
-4. The verification (QR) link on a pre-migration certificate validates
-   on the public URL
-5. Cron runs error-free:
-   `sudo -u www-data php /moodle/html/moodle/admin/cli/cron.php`
+If the source site used add-on plugins (for example the Workplace
+certificate plugins), install their code on the target next — see
+[Migrating the Workplace certificate plugins](./Migration-Workplace-Certificate-Plugins.md).
 
 ## Rolling back
 
-The Step 1 backup allows a full rollback of the database:
+The Step 1 backup allows a full rollback of the database. Use the
+same reset-and-import strategy as Step 3 (drop/recreate removes
+migration-only tables; the admin user is needed for `LOCK TABLES`),
+and keep maintenance mode enabled until the frontends are refreshed:
 
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --enable
-gunzip < /moodle/db-backup-pre-migration.sql.gz | mysql -h <mysql-host> -u <dbuser> -p'<dbpass>'
-sudo -u www-data php /moodle/html/moodle/admin/cli/purge_caches.php
-sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --disable
-```
-
-To remove the certificate plugin code without touching the migrated
-data (the data stays in the database and filedir):
-
-```bash
-rm -rf /moodle/html/moodle/public/admin/tool/certificate \
-       /moodle/html/moodle/public/mod/coursecertificate
+mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+  -p"$MOODLE_DATABASE_ADMIN_PASSWORD" -e \
+  "DROP DATABASE moodle; CREATE DATABASE moodle DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+gunzip < /moodle/db-backup-pre-migration.sql.gz \
+  | mysql -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+      -p"$MOODLE_DATABASE_ADMIN_PASSWORD" moodle
 sudo -u www-data php /moodle/html/moodle/admin/cli/purge_caches.php
 ```
 
-Then repeat the classmap rebuild and service restarts on the
-controller and all web frontends (Step 6).
+If `$CFG->prefix` was changed in Step 4, restore the original value.
+Then repeat Step 7 (propagate to the web frontends — restarts happen
+only there, never on the controller) and Step 8 (disable maintenance
+mode).
