@@ -73,6 +73,7 @@ if ! mysqldump -h <source-mysql-host> -u <source-dbadmin> -p'<source-dbadminpass
     --single-transaction moodle | gzip > source-db.sql.gz; then
   rm -f source-db.sql.gz
   echo "SOURCE DUMP FAILED — fix the error before continuing"
+  exit 1
 fi
 ```
 
