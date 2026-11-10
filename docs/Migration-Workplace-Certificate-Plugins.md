@@ -64,16 +64,21 @@ Save this backup under a **different filename** than the
 pre-migration backup — reusing
 `/moodle/db-backup-pre-migration.sql.gz` would overwrite the only
 copy of the original target database that the migration guide's
-rollback relies on. `set -o pipefail` makes a failed `mysqldump`
-abort the pipeline instead of leaving an empty archive:
+rollback relies on. `set -o pipefail` only makes the pipeline's exit
+status reflect a `mysqldump` failure — the explicit check below is
+what discards the failed archive and stops the procedure (a truncated
+dump still gzips cleanly, so it must never be left behind):
 
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --enable
 set -o pipefail
-mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
-  -p"$MOODLE_DATABASE_ADMIN_PASSWORD" --single-transaction moodle \
-  | gzip > /moodle/db-backup-pre-plugins.sql.gz
-gunzip -t /moodle/db-backup-pre-plugins.sql.gz   # verify before continuing
+if ! mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+    -p"$MOODLE_DATABASE_ADMIN_PASSWORD" --single-transaction moodle \
+    | gzip > /moodle/db-backup-pre-plugins.sql.gz; then
+  rm -f /moodle/db-backup-pre-plugins.sql.gz
+  echo "BACKUP FAILED — do not continue"
+fi
+ls -l /moodle/db-backup-pre-plugins.sql.gz   # confirm a plausible size
 ```
 
 ## Download and install the plugin code
@@ -91,8 +96,10 @@ above and each repository's *Releases* page), and record it:
 TOOL_CERT_TAG="<tool_certificate-release-tag>"
 MOD_CERT_TAG="<mod_coursecertificate-release-tag>"
 
+# Reset the staging directory — leftovers from a previous run would make
+# the mv commands below nest the new releases inside the old directories
+rm -rf /tmp/moodle-plugins
 mkdir -p /tmp/moodle-plugins && cd /tmp/moodle-plugins
-rm -f tool_certificate.zip mod_coursecertificate.zip
 curl -fLo tool_certificate.zip \
   "https://github.com/moodleworkplace/moodle-tool_certificate/archive/refs/tags/${TOOL_CERT_TAG}.zip"
 curl -fLo mod_coursecertificate.zip \
@@ -150,6 +157,18 @@ Finally verify:
    on the public URL
 5. Cron runs error-free:
    `sudo -u www-data php /moodle/html/moodle/admin/cli/cron.php`
+
+**IMPORTANT NOTE**
+
+QR verification links embedded in certificates that were **already
+downloaded or printed** before the migration are hard-coded to the
+*source* hostname — the database URL replacement in Step 6 of the
+migration guide cannot update them. If the public hostname changed,
+keep the source hostname reachable over HTTPS with redirects to the
+new site that preserve the verification path and query string
+(`/admin/tool/certificate/index.php?code=...`), or those certificates
+become unverifiable once the source is retired. The simplest option is
+retaining the original public URL (Step 6, first option).
 
 ## Rolling back
 

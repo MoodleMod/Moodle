@@ -65,11 +65,15 @@ sudo -u www-data php <source-moodle>/admin/cli/maintenance.php --enable
 # stop the source cron, e.g.:
 crontab -u www-data -l   # note the moodle cron entry, then remove/comment it
 
-# take the dump; pipefail makes a failed mysqldump abort the pipeline
-# instead of leaving a truncated-but-valid-looking archive
+# pipefail makes the pipeline's exit status reflect a mysqldump failure;
+# the explicit check then discards the bad archive and stops — a
+# truncated dump still gzips cleanly, so it must never be left behind
 set -o pipefail
-mysqldump -h <source-mysql-host> -u <source-dbadmin> -p'<source-dbadminpass>' \
-  --single-transaction moodle | gzip > source-db.sql.gz
+if ! mysqldump -h <source-mysql-host> -u <source-dbadmin> -p'<source-dbadminpass>' \
+    --single-transaction moodle | gzip > source-db.sql.gz; then
+  rm -f source-db.sql.gz
+  echo "SOURCE DUMP FAILED — fix the error before continuing"
+fi
 ```
 
 If the source site does not live on Azure Files, upload `moodledata/`
@@ -118,22 +122,28 @@ the database **admin** credentials are in the deployment outputs
 
 Take the backup with the database **admin** account — default dumps
 contain `LOCK TABLES` statements that the application user from
-`config.php` is not granted. `set -o pipefail` makes a failed
-`mysqldump` abort the pipeline instead of leaving an empty archive
-that Step 3 would then trust:
+`config.php` is not granted. `set -o pipefail` only makes the
+pipeline's exit status reflect a `mysqldump` failure — the explicit
+check below is what discards the failed archive and stops the
+procedure. Without it, Step 3 would drop the target database and
+import a partial dump (`gunzip -t` cannot catch this: an archive of
+truncated SQL is still a valid gzip file):
 
 ```bash
 sudo -u www-data php /moodle/html/moodle/admin/cli/maintenance.php --enable
 set -o pipefail
-mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
-  -p"$MOODLE_DATABASE_ADMIN_PASSWORD" --single-transaction moodle \
-  | gzip > /moodle/db-backup-pre-migration.sql.gz
+if ! mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
+    -p"$MOODLE_DATABASE_ADMIN_PASSWORD" --single-transaction moodle \
+    | gzip > /moodle/db-backup-pre-migration.sql.gz; then
+  rm -f /moodle/db-backup-pre-migration.sql.gz
+  echo "BACKUP FAILED — do not continue"
+fi
 ```
 
-Verify the backup is non-empty and intact before continuing:
+Confirm the archive exists with a plausible size before continuing:
 
 ```bash
-gunzip -t /moodle/db-backup-pre-migration.sql.gz && ls -l /moodle/db-backup-pre-migration.sql.gz
+ls -l /moodle/db-backup-pre-migration.sql.gz
 ```
 
 Maintenance mode stays enabled through Step 8.
@@ -200,11 +210,13 @@ gunzip < /moodle/source-db.sql.gz \
 If the source database uses a table prefix other than the target's
 `$CFG->prefix` (default `mdl_`), the upgrade would read the wrong
 tables. Compare them — the prefix is taken from the core
-`config_plugins` table, whose name is unambiguous in a dump:
+`config_plugins` table, whose name is unambiguous in a dump (the
+character class includes uppercase: prefixes such as `MDL_` are
+valid):
 
 ```bash
 grep 'CFG->prefix' /moodle/html/moodle/config.php
-zcat /moodle/source-db.sql.gz | grep -o -m1 'CREATE TABLE `[a-z0-9_]*config_plugins`'
+zcat /moodle/source-db.sql.gz | grep -o -m1 'CREATE TABLE `[A-Za-z0-9_]*config_plugins`'
 ```
 
 The source prefix is the table name with the `config_plugins` suffix
@@ -235,9 +247,16 @@ site (in course HTML, forum posts, etc.) — keeping the target
 `config.php` only fixes `$CFG->wwwroot`, not stored content. Choose
 one:
 
-* **Retain the source public URL**: point its DNS (or Front Door /
-  load-balancer custom domain) at the new cluster, and skip the
-  replacement below; or
+* **Retain the source public URL.** Changing DNS alone is not enough:
+  the deployment set `$CFG->wwwroot` to the generated target hostname,
+  so Moodle would keep generating links and redirects to it. To retain
+  the source URL:
+  1. point the source hostname's DNS (or Front Door / load-balancer
+     custom domain) at the new cluster and configure TLS for it,
+  2. edit `/moodle/html/moodle/config.php` and set `$CFG->wwwroot` to
+     the source URL — this propagates to the frontends in Step 8, and
+  3. use the source hostname instead of the generated one in the
+     Step 10 verification.
 * **Rewrite stored URLs** with Moodle's database search-and-replace
   tool:
 
@@ -245,6 +264,13 @@ one:
 sudo -u www-data php /moodle/html/moodle/public/admin/tool/replace/cli/replace.php \
   --search='https://<source-hostname>' --replace="https://<target-hostname>" --non-interactive
 ```
+
+If the target URL is **longer** than the source URL, the tool aborts
+with `cannotfit` because rewritten values could exceed full-length
+database columns. In that case either use a shorter target URL (for
+example a custom domain) or rerun with an explicit `--shorten` — do
+**not** add `--shorten` unconditionally, as it truncates values that
+exceed column limits.
 
 Skip this step entirely only when source and target share the same
 public hostname.
