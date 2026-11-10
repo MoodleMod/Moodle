@@ -138,6 +138,7 @@ if ! mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
     | gzip > /moodle/db-backup-pre-migration.sql.gz; then
   rm -f /moodle/db-backup-pre-migration.sql.gz
   echo "BACKUP FAILED — do not continue"
+  exit 1
 fi
 ```
 

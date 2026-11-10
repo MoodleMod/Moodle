@@ -77,6 +77,7 @@ if ! mysqldump -h $MOODLE_DATABASE_DNS -u $MOODLE_DATABASE_ADMIN_USERNAME \
     | gzip > /moodle/db-backup-pre-plugins.sql.gz; then
   rm -f /moodle/db-backup-pre-plugins.sql.gz
   echo "BACKUP FAILED — do not continue"
+  exit 1
 fi
 ls -l /moodle/db-backup-pre-plugins.sql.gz   # confirm a plausible size
 ```
